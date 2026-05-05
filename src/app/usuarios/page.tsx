@@ -1,0 +1,376 @@
+'use client';
+
+import React, { useMemo, useState } from 'react';
+import { Plus, Trash2, Pencil, CheckCircle2, XCircle, X, Shield, User, Crown, Info } from 'lucide-react';
+import { useSistema } from '@/app/context/SistemaContext';
+import ConfirmModal from '@/app/components/ConfirmModal';
+import type { Role, Usuario } from '@/app/types';
+import { FISCAL_DEPT_NOME, FISCAL_SN_DEPT_NOME } from '@/app/types';
+
+const ROLE_ORDER: Record<string, number> = { admin: 0, gerente: 1, usuario: 2 };
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return fallback;
+}
+
+export default function UsuariosPage() {
+  const { canAdmin, currentUser, usuarios, departamentos, criarUsuario, atualizarUsuario, toggleUsuarioAtivo, removerUsuario, criarDepartamento, mostrarAlerta, isDeveloper, isGhost, protectedUserIds } = useSistema();
+  const [criandoSnDept, setCriandoSnDept] = useState(false);
+
+  const fiscalDept = useMemo(
+    () => departamentos.find((d) => d.nome.trim().toLowerCase() === FISCAL_DEPT_NOME) ?? null,
+    [departamentos]
+  );
+  const fiscalSnDept = useMemo(
+    () => departamentos.find((d) => d.nome.trim().toLowerCase() === FISCAL_SN_DEPT_NOME) ?? null,
+    [departamentos]
+  );
+
+  const [nome, setNome] = useState('');
+  const [email, setEmail] = useState('');
+  const [senha, setSenha] = useState('');
+  const [role, setRole] = useState<Role>('usuario');
+  const [depId, setDepId] = useState<string>('');
+
+  const [editUser, setEditUser] = useState<Usuario | null>(null);
+  const [editNome, setEditNome] = useState('');
+  const [editEmail, setEditEmail] = useState('');
+  const [editSenha, setEditSenha] = useState('');
+  const [editRole, setEditRole] = useState<Role>('usuario');
+  const [editDepId, setEditDepId] = useState<string>('');
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string | null>(null);
+
+  const deps = useMemo(() => departamentos, [departamentos]);
+
+  const usuariosOrdenados = useMemo(() =>
+    [...usuarios].sort((a, b) => {
+      const ra = ROLE_ORDER[a.role] ?? 9;
+      const rb = ROLE_ORDER[b.role] ?? 9;
+      if (ra !== rb) return ra - rb;
+      return a.nome.localeCompare(b.nome, 'pt-BR');
+    }),
+    [usuarios]
+  );
+
+  const openEditModal = (u: Usuario) => {
+    setEditUser(u);
+    setEditNome(u.nome);
+    setEditEmail(u.email);
+    setEditSenha('');
+    setEditRole(u.role);
+    setEditDepId(u.departamentoId || '');
+  };
+
+  const handleEditSave = async () => {
+    if (!editUser) return;
+    if (!editNome.trim() || !editEmail.trim()) {
+      mostrarAlerta('Campos obrigatórios', 'Nome e email são obrigatórios.', 'aviso');
+      return;
+    }
+    const nome = editNome.trim();
+    const email = editEmail.trim();
+    const currentEmail = editUser.email.trim();
+    const patch: Partial<Usuario> = {};
+    if (nome !== editUser.nome) patch.nome = nome;
+    if (email.toLowerCase() !== currentEmail.toLowerCase()) patch.email = email;
+    if (editRole !== editUser.role) patch.role = editRole;
+    const nextDepId = editDepId || null;
+    if ((editUser.departamentoId ?? null) !== nextDepId) patch.departamentoId = nextDepId;
+    if (editSenha.trim()) {
+      patch.senha = editSenha.trim();
+    }
+    if (Object.keys(patch).length === 0) {
+      mostrarAlerta('Sem alterações', 'Nenhum dado foi alterado.', 'aviso');
+      return;
+    }
+    try {
+      await atualizarUsuario(editUser.id, patch);
+      setEditUser(null);
+      mostrarAlerta('Usuário atualizado', `${nome} foi atualizado com sucesso.`, 'sucesso');
+    } catch (err: unknown) {
+      mostrarAlerta('Erro ao atualizar', getErrorMessage(err, 'Não foi possível atualizar o usuário.'), 'erro');
+    }
+  };
+
+  if (!canAdmin) {
+    return (
+      <div className="rounded-2xl bg-white p-6 shadow-sm">
+        <div className="text-lg font-bold text-gray-900">Usuários</div>
+        <div className="mt-2 text-sm text-gray-600">Apenas administradores têm acesso a esta área.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-2xl bg-white p-4 sm:p-6 shadow-sm">
+        <div className="text-xl sm:text-2xl font-bold text-gray-900">Gerenciar Usuários</div>
+        <div className="text-sm text-gray-500">Crie usuários, defina o cargo e vincule ao departamento</div>
+
+        {/* Dica: divisão Fiscal x Fiscal - SN */}
+        {fiscalDept && !fiscalSnDept && (
+          <div className="mt-4 rounded-xl bg-amber-50 border border-amber-200 p-3 sm:p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+            <Info size={18} className="text-amber-600 shrink-0" />
+            <div className="flex-1 text-xs sm:text-sm text-amber-900">
+              Para usuários do <span className="font-bold">Simples Nacional</span> existe um departamento separado.
+              Crie agora o <span className="font-bold">&quot;Fiscal - SN&quot;</span> para já poder vinculá-los aqui.
+            </div>
+            <button
+              type="button"
+              disabled={criandoSnDept}
+              onClick={async () => {
+                setCriandoSnDept(true);
+                try {
+                  await criarDepartamento('Fiscal - SN');
+                  mostrarAlerta('Departamento criado', '"Fiscal - SN" foi adicionado. Já pode vincular usuários.', 'sucesso');
+                } catch {
+                  mostrarAlerta('Erro', 'Não foi possível criar o departamento.', 'erro');
+                } finally {
+                  setCriandoSnDept(false);
+                }
+              }}
+              className="rounded-xl bg-amber-600 hover:bg-amber-700 text-white px-3 py-2 text-xs sm:text-sm font-bold shadow disabled:opacity-50 shrink-0"
+            >
+              {criandoSnDept ? 'Criando...' : 'Criar "Fiscal - SN"'}
+            </button>
+          </div>
+        )}
+
+        <div className="mt-6 rounded-2xl bg-cyan-50 p-5">
+          <div className="font-bold text-cyan-900">Criar Novo Usuário</div>
+          <div className="text-[11px] sm:text-xs text-cyan-700 mt-1">
+            Para usuários fiscais, escolha entre <span className="font-bold">Fiscal</span> (regime normal) e <span className="font-bold">Fiscal - SN</span> (Simples Nacional) no campo Departamento.
+          </div>
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Field label="Nome">
+              <input value={nome} onChange={(e) => setNome(e.target.value)} className="w-full rounded-xl bg-white px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400" placeholder="Nome do usuário" />
+            </Field>
+            <Field label="Senha">
+              <input type="password" value={senha} onChange={(e) => setSenha(e.target.value)} className="w-full rounded-xl bg-white px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400" placeholder="Senha" />
+            </Field>
+            <Field label="Email (login)">
+              <input value={email} onChange={(e) => setEmail(e.target.value)} className="w-full rounded-xl bg-white px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400" placeholder="email@empresa.com" />
+            </Field>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Field label="Cargo">
+                <select value={role} onChange={(e) => { setRole(e.target.value as Role); if (e.target.value === 'admin') setDepId(''); }} className="w-full rounded-xl bg-white px-4 py-3 text-gray-900">
+                  <option value="usuario">Usuário</option>
+                  <option value="gerente">Gerente</option>
+                  <option value="admin">Administrador</option>
+                </select>
+              </Field>
+              {role !== 'admin' && (
+                <Field label="Departamento">
+                  <select value={depId} onChange={(e) => setDepId(e.target.value)} className="w-full rounded-xl bg-white px-4 py-3 text-gray-900">
+                    <option value="">Selecione...</option>
+                    {deps.map((d) => (
+                      <option key={d.id} value={d.id}>{d.nome}</option>
+                    ))}
+                  </select>
+                </Field>
+              )}
+            </div>
+          </div>
+
+          <button
+            onClick={async () => {
+              if (!nome.trim() || !email.trim() || !senha.trim()) {
+                mostrarAlerta('Campos obrigatórios', 'Nome, email e senha são obrigatórios.', 'aviso');
+                return;
+              }
+              try {
+                await criarUsuario({
+                  nome: nome.trim(),
+                  email: email.trim(),
+                  senha,
+                  role,
+                  departamentoId: depId || null,
+                  ativo: true,
+                });
+                setNome('');
+                setEmail('');
+                setSenha('');
+                setRole('usuario');
+                setDepId('');
+                mostrarAlerta('Usuário criado', 'Usuário criado com sucesso.', 'sucesso');
+              } catch (err: unknown) {
+                mostrarAlerta('Erro ao criar usuário', getErrorMessage(err, 'Nao foi possivel criar o usuario.'), 'erro');
+              }
+            }}
+            className="mt-4 inline-flex items-center gap-2 w-full rounded-xl bg-gradient-to-r from-cyan-600 to-teal-500 text-white px-4 py-3 font-bold hover:from-cyan-700 hover:to-teal-600 shadow-md justify-center"
+          >
+            <Plus size={18} />
+            Criar Usuário
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl bg-white p-4 sm:p-6 shadow-sm">
+        <div className="text-lg font-bold text-gray-900">Usuários Cadastrados ({usuariosOrdenados.length})</div>
+
+        <div className="mt-4 space-y-3">
+          {usuariosOrdenados.map((u) => {
+            const isProtectedAccount = protectedUserIds.includes(u.id);
+            const isSelf = u.id === currentUser?.id;
+            // Dev e ghost podem agir sobre todos; admins só sobre si ou não-admins (exceto contas protegidas)
+            const canActOnUser =
+              isDeveloper || isGhost ||
+              (!isProtectedAccount && (u.role !== 'admin' || isSelf));
+            // Ninguém pode desativar ou excluir a si mesmo
+            const canToggleOrDelete = canActOnUser && !isSelf;
+            return (
+            <div key={u.id} className="rounded-2xl bg-gray-50 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 hover:shadow-sm transition-shadow">
+              <div className="min-w-0 flex items-center gap-3">
+                <div className={`h-10 w-10 rounded-xl flex items-center justify-center ${u.role === 'admin' ? 'bg-red-100' : u.role === 'gerente' ? 'bg-amber-100' : 'bg-gray-200'}`}>
+                  {u.role === 'admin'
+                    ? <Crown size={18} className="text-red-600" />
+                    : u.role === 'gerente'
+                      ? <Shield size={18} className="text-amber-600" />
+                      : <User size={18} className="text-gray-500" />}
+                </div>
+                <div className="min-w-0">
+                  <div className="font-bold text-gray-900 truncate">{u.nome}</div>
+                  <div className="text-sm text-gray-500 truncate">{u.email}</div>
+                  <div className="text-xs text-gray-400 mt-0.5">
+                    {u.role === 'admin' ? 'Administrador' : u.role === 'gerente' ? 'Gerente' : 'Usuário'}
+                    {u.departamentoId ? ` · ${deps.find((d) => d.id === u.departamentoId)?.nome ?? ''}` : ''}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <span className={"rounded-full px-3 py-1 text-xs font-bold " + (u.ativo ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-200 text-gray-500')}>
+                  {u.ativo ? 'Ativo' : 'Inativo'}
+                </span>
+
+                {canToggleOrDelete && (
+                  <button
+                    onClick={() => toggleUsuarioAtivo(u.id)}
+                    className="rounded-xl bg-white p-2 hover:bg-gray-100 transition shadow-sm"
+                    title={u.ativo ? 'Desativar' : 'Ativar'}
+                  >
+                    {u.ativo ? <XCircle className="text-amber-500" size={18} /> : <CheckCircle2 className="text-emerald-500" size={18} />}
+                  </button>
+                )}
+
+                {canActOnUser && (
+                  <button
+                    onClick={() => openEditModal(u)}
+                    className="rounded-xl bg-white p-2 hover:bg-teal-50 transition shadow-sm"
+                    title="Editar"
+                  >
+                    <Pencil className="text-teal-600" size={18} />
+                  </button>
+                )}
+
+                {canToggleOrDelete && !isProtectedAccount && (
+                  <button
+                    onClick={() => setConfirmDeleteUserId(u.id)}
+                    className="rounded-xl bg-white p-2 hover:bg-red-50 transition shadow-sm"
+                    title="Excluir"
+                  >
+                    <Trash2 className="text-red-500" size={18} />
+                  </button>
+                )}
+              </div>
+            </div>
+            );
+          })}
+
+          {usuarios.length === 0 && <div className="text-sm text-gray-500">Sem usuários.</div>}
+        </div>
+      </div>
+
+      {/* Modal de Edição */}
+      {editUser && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4" onMouseDown={(e) => e.currentTarget === e.target && setEditUser(null)}>
+          <div className="absolute inset-0 bg-black/50" />
+          <div className="relative w-full max-w-lg rounded-2xl bg-white shadow-2xl overflow-hidden">
+            <div className="bg-gradient-to-r from-cyan-600 to-teal-500 p-5 flex items-center justify-between">
+              <div>
+                <div className="text-lg font-bold text-white">Editar Usuário</div>
+                <div className="text-sm text-cyan-100">{editUser.email}</div>
+              </div>
+              <button onClick={() => setEditUser(null)} className="text-white/80 hover:text-white">
+                <X size={22} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <Field label="Nome">
+                <input value={editNome} onChange={(e) => setEditNome(e.target.value)} className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400 focus:bg-white" />
+              </Field>
+
+              <Field label="Email (login)">
+                <input value={editEmail} onChange={(e) => setEditEmail(e.target.value)} className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400 focus:bg-white" />
+              </Field>
+
+              <Field label="Nova Senha (deixe vazio para manter)">
+                <input type="password" value={editSenha} onChange={(e) => setEditSenha(e.target.value)} className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400 focus:bg-white" placeholder="Nova senha" />
+              </Field>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Field label="Cargo">
+                  <select value={editRole} onChange={(e) => { setEditRole(e.target.value as Role); if (e.target.value === 'admin') setEditDepId(''); }} className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900">
+                    <option value="usuario">Usuário</option>
+                    <option value="gerente">Gerente</option>
+                    <option value="admin">Administrador</option>
+                  </select>
+                </Field>
+                {editRole !== 'admin' && (
+                  <Field label="Departamento">
+                    <select value={editDepId} onChange={(e) => setEditDepId(e.target.value)} className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900">
+                      <option value="">Nenhum</option>
+                      {deps.map((d) => (
+                        <option key={d.id} value={d.id}>{d.nome}</option>
+                      ))}
+                    </select>
+                  </Field>
+                )}
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  onClick={() => setEditUser(null)}
+                  className="flex-1 rounded-xl bg-gray-100 px-4 py-3 font-semibold text-gray-700 hover:bg-gray-200 transition"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={handleEditSave}
+                  className="flex-1 rounded-xl bg-gradient-to-r from-cyan-600 to-teal-500 text-white px-4 py-3 font-bold hover:from-cyan-700 hover:to-teal-600 shadow-md"
+                >
+                  Salvar Alterações
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmModal
+        open={!!confirmDeleteUserId}
+        title="Remover usuário"
+        message="Tem certeza que deseja remover este usuário? Esta ação não pode ser desfeita."
+        confirmText="Remover"
+        variant="danger"
+        onConfirm={() => { if (confirmDeleteUserId) removerUsuario(confirmDeleteUserId); setConfirmDeleteUserId(null); }}
+        onCancel={() => setConfirmDeleteUserId(null)}
+      />
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-sm font-semibold text-gray-700 mb-2">{label}</label>
+      {children}
+    </div>
+  );
+}

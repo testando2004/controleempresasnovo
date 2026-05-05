@@ -1,0 +1,1409 @@
+'use client';
+
+import React, { useMemo, useRef, useState, useEffect } from 'react';
+import { Loader2, Search, X, Plus, Trash2, Paperclip, AlertTriangle, CalendarClock, Eye, Download } from 'lucide-react';
+import { useSistema } from '@/app/context/SistemaContext';
+import type { Empresa, FormaEnvio, RetItem, TagCor, TipoInscricao, UUID, VencimentoFiscal } from '@/app/types';
+import { FORMAS_ENVIO } from '@/app/types';
+import ModalBase from '@/app/components/ModalBase';
+import ConfirmModal from '@/app/components/ConfirmModal';
+import { cepSchema, cpfSchema, cnpjSchema, detectTipoInscricao, detectTipoEstabelecimento, formatarDocumento } from '@/app/utils/validation';
+import { api } from '@/app/utils/api';
+import { garantirVencimentosFiscais, garantirVencimentosFiscaisComRegras } from '@/app/utils/vencimentos';
+import { uploadDocumentoArquivo, getVencimentoFiscalSignedUrl } from '@/lib/db';
+import { sortByPtBr, sortStringsPtBr } from '@/lib/sort';
+
+const MAX_FISCAL_FILE_SIZE = 10 * 1024 * 1024;
+
+interface ModalCadastrarEmpresaProps {
+  onClose: () => void;
+  empresa?: Empresa;
+}
+
+function newId(): UUID {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
+  return `id_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+/** Formata número do RET no padrão XX.XXXXXXXXX-XX (13 dígitos) */
+function formatRetNumber(value: string): string {
+  const digits = value.replace(/\D/g, '').slice(0, 13);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 11) return `${digits.slice(0, 2)}.${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}.${digits.slice(2, 11)}-${digits.slice(11)}`;
+}
+
+const TAG_COLORS: Record<TagCor, { bg: string; text: string; border: string }> = {
+  red: { bg: 'bg-red-100', text: 'text-red-700', border: 'border-red-300' },
+  orange: { bg: 'bg-orange-100', text: 'text-orange-700', border: 'border-orange-300' },
+  amber: { bg: 'bg-amber-100', text: 'text-amber-700', border: 'border-amber-300' },
+  green: { bg: 'bg-green-100', text: 'text-green-700', border: 'border-green-300' },
+  emerald: { bg: 'bg-emerald-100', text: 'text-emerald-700', border: 'border-emerald-300' },
+  cyan: { bg: 'bg-cyan-100', text: 'text-cyan-700', border: 'border-cyan-300' },
+  blue: { bg: 'bg-blue-100', text: 'text-blue-700', border: 'border-blue-300' },
+  violet: { bg: 'bg-violet-100', text: 'text-violet-700', border: 'border-violet-300' },
+  purple: { bg: 'bg-purple-100', text: 'text-purple-700', border: 'border-purple-300' },
+  pink: { bg: 'bg-pink-100', text: 'text-pink-700', border: 'border-pink-300' },
+  rose: { bg: 'bg-rose-100', text: 'text-rose-700', border: 'border-rose-300' },
+  slate: { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-300' },
+};
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return fallback;
+}
+
+export default function ModalCadastrarEmpresa({ onClose, empresa }: ModalCadastrarEmpresaProps) {
+  const { empresas, criarEmpresa, atualizarEmpresa, mostrarAlerta, departamentos, usuarios, servicos: servicosCadastrados, tags: tagsCadastradas, criarServico, canManage, removerRet: removerRetContext } = useSistema();
+
+  const [empresaCadastrada, setEmpresaCadastrada] = useState(empresa ? empresa.cadastrada !== false : false);
+
+  const [formData, setFormData] = useState<Partial<Empresa>>({
+    cnpj: '',
+    codigo: '',
+    razao_social: '',
+    apelido: '',
+    data_abertura: '',
+    tipoEstabelecimento: '',
+    tipoInscricao: '',
+
+    servicos: [],
+    tags: [],
+
+    possuiRet: false,
+    rets: [],
+
+    vencimentosFiscais: garantirVencimentosFiscais([]),
+    formaEnvio: [],
+
+    inscricao_estadual: '',
+    inscricao_municipal: '',
+    regime_federal: '',
+    regime_estadual: '',
+    regime_municipal: '',
+
+    estado: '',
+    cidade: '',
+    bairro: '',
+    logradouro: '',
+    numero: '',
+    cep: '',
+
+    email: '',
+    telefone: '',
+
+    cadastrada: empresaCadastrada,
+    responsaveis: {},
+  });
+
+  const [servicoNovo, setServicoNovo] = useState('');
+  const [erros, setErros] = useState<Record<string, string>>({});
+  const [buscandoCnpj, setBuscandoCnpj] = useState(false);
+  const [cnpjLookupError, setCnpjLookupError] = useState<string>('');
+  const [cnpjTouched, setCnpjTouched] = useState(false);
+  const [confirmDeleteRetId, setConfirmDeleteRetId] = useState<string | null>(null);
+  // Arquivos pendentes de upload para os vencimentos fiscais: { fiscalId -> File }
+  const [fiscaisPendingFiles, setFiscaisPendingFiles] = useState<Record<string, File>>({});
+  const [fiscalUploading, setFiscalUploading] = useState(false);
+  const lastAutoLookupDigitsRef = useRef<string>('');
+
+  const allServicos = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of servicosCadastrados) set.add(s.nome);
+    for (const s of formData.servicos ?? []) set.add(s);
+    return sortStringsPtBr(Array.from(set));
+  }, [formData.servicos, servicosCadastrados]);
+
+  const sortedDepartamentos = useMemo(() => sortByPtBr(departamentos, (d) => d.nome), [departamentos]);
+  const activeUsers = useMemo(
+    () => sortByPtBr(usuarios.filter((u) => u.ativo), (u) => u.nome),
+    [usuarios]
+  );
+  const formasEnvioSelecionadas = Array.isArray(formData.formaEnvio) ? formData.formaEnvio : [];
+
+  const cnpjDigits = useMemo(() => String(formData.cnpj || '').replace(/\D/g, ''), [formData.cnpj]);
+  const podeBuscarCnpj = cnpjDigits.length === 14 && !buscandoCnpj;
+
+  const handleBuscarCnpj = async () => {
+    const digits = String(formData.cnpj || '').replace(/\D/g, '');
+    if (digits.length !== 14) {
+      setCnpjLookupError('Digite um CNPJ com 14 dígitos para buscar.');
+      return;
+    }
+
+    const parsed = cnpjSchema.safeParse(String(formData.cnpj || ''));
+    if (!parsed.success) {
+      setCnpjLookupError('CNPJ inválido. Verifique e tente novamente.');
+      return;
+    }
+
+    setBuscandoCnpj(true);
+    setCnpjLookupError('');
+    try {
+      const data = await api.consultarCnpj(digits);
+
+      setFormData((prev) => {
+        const cepDigits = String(data?.cep || '').replace(/\D/g, '');
+        const cepFormatado = cepDigits.length === 8 ? `${cepDigits.slice(0, 5)}-${cepDigits.slice(5, 8)}` : String(data?.cep || '');
+        const numeroDigits = String(data?.numero || '').replace(/\D/g, '');
+        const estadoNovo = String(prev.estado || '').trim() ? prev.estado : (data?.estado || '');
+        const estadoMudou = estadoNovo !== prev.estado;
+
+        return {
+          ...prev,
+          razao_social: String(prev.razao_social || '').trim() ? prev.razao_social : (data?.razao_social || ''),
+          apelido: String(prev.apelido || '').trim() ? prev.apelido : (data?.nome_fantasia || ''),
+          data_abertura: String(prev.data_abertura || '').trim() ? prev.data_abertura : (data?.data_abertura || ''),
+          estado: estadoNovo,
+          cidade: String(prev.cidade || '').trim() ? prev.cidade : (data?.cidade || ''),
+          bairro: String(prev.bairro || '').trim() ? prev.bairro : (data?.bairro || ''),
+          logradouro: String(prev.logradouro || '').trim() ? prev.logradouro : (data?.logradouro || ''),
+          numero: String(prev.numero || '').trim() ? prev.numero : (numeroDigits || ''),
+          cep: String(prev.cep || '').trim() ? prev.cep : (cepFormatado || ''),
+          email: String(prev.email || '').trim() ? prev.email : (data?.email || ''),
+          telefone: String(prev.telefone || '').trim() ? prev.telefone : (data?.telefone || ''),
+          // Se o estado foi descoberto pela consulta CNPJ, preenche automaticamente
+          // os vencimentos fiscais (sem mexer nos que o usuário já preencheu)
+          vencimentosFiscais: estadoMudou
+            ? garantirVencimentosFiscaisComRegras(
+                prev.vencimentosFiscais,
+                estadoNovo,
+                String(prev.cidade || '').trim() ? prev.cidade : (data?.cidade || ''),
+              )
+            : prev.vencimentosFiscais,
+        };
+      });
+
+      setEmpresaCadastrada(true);
+    } catch (error: unknown) {
+      setCnpjLookupError(getErrorMessage(error, 'Nao foi possivel consultar esse CNPJ agora.'));
+    } finally {
+      setBuscandoCnpj(false);
+    }
+  };
+
+  // Auto-consulta do CNPJ: quando completar 14 dígitos, busca após um pequeno debounce.
+  useEffect(() => {
+    if (!cnpjTouched) return;
+    if (!podeBuscarCnpj) return;
+    if (lastAutoLookupDigitsRef.current === cnpjDigits) return;
+
+    const parsed = cnpjSchema.safeParse(String(formData.cnpj || ''));
+    if (!parsed.success) return;
+
+    const t = window.setTimeout(() => {
+      if (lastAutoLookupDigitsRef.current === cnpjDigits) return;
+      lastAutoLookupDigitsRef.current = cnpjDigits;
+      void handleBuscarCnpj();
+    }, 650);
+
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cnpjDigits, podeBuscarCnpj, cnpjTouched]);
+
+  const handleChange = (field: keyof Empresa, value: unknown) => {
+    setFormData((prev) => {
+      const next = {
+        ...prev,
+        [field]: value as Empresa[keyof Empresa],
+      };
+      // Quando o usuário muda a UF ou a cidade, recalcula os vencimentos
+      // fiscais com regra (sem sobrescrever os que ele preencheu na mão).
+      if (field === 'estado') {
+        next.vencimentosFiscais = garantirVencimentosFiscaisComRegras(
+          prev.vencimentosFiscais,
+          value as string,
+          prev.cidade,
+        );
+      } else if (field === 'cidade') {
+        next.vencimentosFiscais = garantirVencimentosFiscaisComRegras(
+          prev.vencimentosFiscais,
+          prev.estado,
+          value as string,
+        );
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    setFormData((prev) => ({
+      ...prev,
+      cadastrada: empresaCadastrada,
+    }));
+  }, [empresaCadastrada]);
+
+  useEffect(() => {
+    if (empresa) {
+      const digits = String(empresa.cnpj || '').replace(/\D/g, '');
+      const autoEstab = detectTipoEstabelecimento(digits);
+      setFormData({
+        ...empresa,
+        tipoEstabelecimento: empresa.tipoEstabelecimento || autoEstab || '',
+        responsaveis: empresa.responsaveis ?? {},
+        servicos: empresa.servicos ?? [],
+        rets: empresa.rets ?? [],
+        vencimentosFiscais: garantirVencimentosFiscaisComRegras(empresa.vencimentosFiscais, empresa.estado, empresa.cidade),
+        formaEnvio: empresa.formaEnvio ?? [],
+      });
+      setEmpresaCadastrada(empresa.cadastrada !== false);
+      setCnpjTouched(false);
+      lastAutoLookupDigitsRef.current = digits;
+    } else {
+      // ao criar, garante responsaveis com todos departamentos
+      setFormData((prev) => {
+        const next: Partial<Empresa> = { ...prev };
+        const resp: Record<string, string | null> = { ...(next.responsaveis ?? {}) };
+        for (const d of departamentos) if (!(d.id in resp)) resp[d.id] = null;
+        next.responsaveis = resp;
+        return next;
+      });
+      setCnpjTouched(false);
+      lastAutoLookupDigitsRef.current = '';
+    }
+  }, [empresa, departamentos]);
+
+  const formatarCPFCNPJ = (valor: string): string => {
+    return formatarDocumento(valor, formData.tipoInscricao as TipoInscricao | undefined);
+  };
+
+  const formatarCEP = (valor: string): string => {
+    const apenasNumeros = valor.replace(/\D/g, '');
+    if (apenasNumeros.length <= 5) return apenasNumeros;
+    return `${apenasNumeros.slice(0, 5)}-${apenasNumeros.slice(5, 8)}`;
+  };
+
+  const tipoEstabelecimentoSelectValue = formData.tipoInscricao === 'CNO'
+    ? 'cno'
+    : String(formData.tipoEstabelecimento || '');
+
+  const handleTipoEstabelecimentoChange = (value: string) => {
+    if (value === 'cno') {
+      handleChange('tipoEstabelecimento', '');
+      handleChange('tipoInscricao', 'CNO');
+      return;
+    }
+
+    handleChange('tipoEstabelecimento', value);
+
+    if (formData.tipoInscricao === 'CNO') {
+      const autoTipo = detectTipoInscricao(String(formData.cnpj || ''), '');
+      handleChange('tipoInscricao', autoTipo || '');
+    }
+  };
+
+  const toggleServico = (servico: string) => {
+    setFormData((prev) => {
+      const current = prev.servicos ?? [];
+      const exists = current.includes(servico);
+      return { ...prev, servicos: exists ? current.filter((s) => s !== servico) : [...current, servico] };
+    });
+  };
+
+  const addServico = async () => {
+    const s = servicoNovo.trim();
+    if (!s) return;
+    setServicoNovo('');
+    // Register globally if new
+    if (!servicosCadastrados.some((sc) => sc.nome.toLowerCase() === s.toLowerCase())) {
+      await criarServico(s);
+    }
+    setFormData((prev) => ({ ...prev, servicos: Array.from(new Set([...(prev.servicos ?? []), s])) }));
+  };
+
+  const toggleTag = (tagNome: string) => {
+    setFormData((prev) => {
+      const current = prev.tags ?? [];
+      const exists = current.includes(tagNome);
+      return { ...prev, tags: exists ? current.filter((t) => t !== tagNome) : [...current, tagNome] };
+    });
+  };
+
+  const setPossuiRet = (value: boolean) => {
+    setFormData((prev) => ({
+      ...prev,
+      possuiRet: value,
+      rets: value ? (prev.rets ?? []).length ? prev.rets : [{ id: newId(), numeroPta: '', nome: '', vencimento: '', ultimaRenovacao: '', ativo: true, portaria: '' }] : [],
+    }));
+  };
+
+  const addRet = () => {
+    setFormData((prev) => ({
+      ...prev,
+      possuiRet: true,
+      rets: [...(prev.rets ?? []), { id: newId(), numeroPta: '', nome: '', vencimento: '', ultimaRenovacao: '', ativo: true, portaria: '' }],
+    }));
+  };
+
+  const updateRet = (id: UUID, patch: Partial<RetItem>) => {
+    setFormData((prev) => ({
+      ...prev,
+      rets: (prev.rets ?? []).map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    }));
+  };
+
+  const updateVencimentoFiscal = (id: UUID, patch: Partial<VencimentoFiscal>) => {
+    setFormData((prev) => ({
+      ...prev,
+      vencimentosFiscais: (prev.vencimentosFiscais ?? []).map((v) =>
+        v.id === id ? { ...v, ...patch } : v
+      ),
+    }));
+  };
+
+  const setFiscalFile = (id: UUID, file: File | null) => {
+    if (file && file.size > MAX_FISCAL_FILE_SIZE) {
+      mostrarAlerta('Arquivo muito grande', 'O arquivo deve ter no máximo 10MB.', 'aviso');
+      return;
+    }
+    setFiscaisPendingFiles((prev) => {
+      const next = { ...prev };
+      if (file) next[id] = file;
+      else delete next[id];
+      return next;
+    });
+  };
+
+  const visualizarPendingFile = (file: File) => {
+    const url = URL.createObjectURL(file);
+    window.open(url, '_blank', 'noopener,noreferrer');
+    // Revogar depois de um tempo para o navegador ter chance de carregar
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+
+  const baixarPendingFile = (file: File) => {
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const visualizarArquivoSalvo = async (arquivoUrl: string) => {
+    try {
+      const url = await getVencimentoFiscalSignedUrl(arquivoUrl);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch {
+      mostrarAlerta('Erro ao abrir arquivo', 'Não foi possível gerar o link do arquivo.', 'erro');
+    }
+  };
+
+  const baixarArquivoSalvo = async (arquivoUrl: string, fileName: string) => {
+    try {
+      const url = await getVencimentoFiscalSignedUrl(arquivoUrl);
+      const res = await fetch(url);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = fileName || 'anexo';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(blobUrl);
+    } catch {
+      mostrarAlerta('Erro ao baixar', 'Não foi possível baixar o arquivo.', 'erro');
+    }
+  };
+
+  const removeRet = async (id: UUID) => {
+    // Se a empresa já existe no banco, mover o RET para lixeira
+    if (empresa?.id) {
+      const retExisteNoBanco = empresa.rets.some((r) => r.id === id);
+      if (retExisteNoBanco) {
+        await removerRetContext(empresa.id, id);
+      }
+    }
+    // Sempre remover do form local
+    setFormData((prev) => {
+      const next = (prev.rets ?? []).filter((r) => r.id !== id);
+      return { ...prev, rets: next, possuiRet: next.length > 0 };
+    });
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const novosErros: Record<string, string> = {};
+    if (!formData.codigo) novosErros.codigo = 'Código é obrigatório';
+    if (empresaCadastrada && !formData.razao_social) novosErros.razao_social = 'Razão Social é obrigatória';
+
+    const digits = String(formData.cnpj || '').replace(/\D/g, '');
+    if (digits.length === 11) {
+      const parsed = cpfSchema.safeParse(String(formData.cnpj || ''));
+      if (!parsed.success) novosErros.cnpj = 'CPF inválido';
+    } else if (digits.length === 14) {
+      const parsed = cnpjSchema.safeParse(String(formData.cnpj || ''));
+      if (!parsed.success) novosErros.cnpj = 'CNPJ inválido';
+    }
+    if (formData.cep) {
+      const parsedCep = cepSchema.safeParse(String(formData.cep || ''));
+      if (!parsedCep.success) novosErros.cep = 'CEP inválido';
+    }
+
+    if ((formData.possuiRet ?? false) && (formData.rets ?? []).length > 0) {
+      (formData.rets ?? []).forEach((r, idx) => {
+        if (!r.numeroPta?.trim()) novosErros[`ret_${idx}_numeroPta`] = 'Número do PTA é obrigatório';
+        if (!r.nome?.trim()) novosErros[`ret_${idx}_nome`] = 'Nome do RET é obrigatório';
+        if (!r.vencimento) novosErros[`ret_${idx}_vencimento`] = 'Vencimento é obrigatório';
+        // ultimaRenovacao is optional
+      });
+    }
+
+    setErros(novosErros);
+    if (Object.keys(novosErros).length > 0) return;
+
+    if (!formData.codigo || (empresaCadastrada && !formData.razao_social)) {
+      void mostrarAlerta('Campos obrigatórios', 'Preencha os campos obrigatórios.', 'aviso');
+      return;
+    }
+
+    // Validação de duplicatas (código, CNPJ)
+    const outrasEmpresas = empresas.filter((e) => e.id !== empresa?.id);
+    const codigoDuplicado = outrasEmpresas.find((e) => e.codigo.trim().toLowerCase() === (formData.codigo || '').trim().toLowerCase());
+    if (codigoDuplicado) {
+      novosErros.codigo = `Já existe uma empresa com o código "${codigoDuplicado.codigo}"`;
+      setErros({ ...novosErros });
+      void mostrarAlerta('Código duplicado', `Já existe uma empresa cadastrada com o código "${codigoDuplicado.codigo}".`, 'aviso');
+      return;
+    }
+
+    const cnpjDigits2 = String(formData.cnpj || '').replace(/\D/g, '');
+    if (cnpjDigits2.length >= 11) {
+      const cnpjDuplicado = outrasEmpresas.find((e) => (e.cnpj || '').replace(/\D/g, '') === cnpjDigits2);
+      if (cnpjDuplicado) {
+        novosErros.cnpj = `Já existe uma empresa com esse CPF/CNPJ`;
+        setErros({ ...novosErros });
+        void mostrarAlerta('CPF/CNPJ duplicado', `Já existe uma empresa cadastrada com esse CPF/CNPJ (${cnpjDuplicado.codigo} - ${cnpjDuplicado.razao_social || cnpjDuplicado.apelido || ''}).`, 'aviso');
+        return;
+      }
+    }
+    const temCnpjValido = cnpjDigits2.length === 14;
+    const cadastrada = empresaCadastrada ? temCnpjValido : temCnpjValido;
+
+    // Upload dos arquivos pendentes dos vencimentos fiscais (antes de salvar a empresa)
+    let vencimentosFiscaisFinal: VencimentoFiscal[] = formData.vencimentosFiscais ?? [];
+    const pendingIds = Object.keys(fiscaisPendingFiles);
+    if (pendingIds.length > 0) {
+      setFiscalUploading(true);
+      try {
+        const empresaIdAtual = empresa?.id;
+        const atualizados = await Promise.all(
+          vencimentosFiscaisFinal.map(async (v) => {
+            const file = fiscaisPendingFiles[v.id];
+            if (!file) return v;
+            try {
+              // Se ainda não temos empresaId (novo cadastro), usa um placeholder — o ID real será aplicado
+              // pelo próprio upload de documento (o caminho inclui empresaId), então para empresas novas
+              // salvamos sem upload e avisamos o usuário.
+              if (!empresaIdAtual) return v;
+              const arquivoUrl = await uploadDocumentoArquivo(empresaIdAtual, file);
+              return { ...v, arquivoUrl };
+            } catch (err) {
+              console.error('Erro upload fiscal', err);
+              mostrarAlerta('Erro no anexo', `Falha ao enviar anexo de "${v.nome}".`, 'erro');
+              return v;
+            }
+          })
+        );
+        vencimentosFiscaisFinal = atualizados;
+        if (!empresa?.id) {
+          mostrarAlerta('Anexos fiscais', 'A empresa ainda não foi criada. Salve e reabra a edição para anexar arquivos aos vencimentos fiscais.', 'aviso');
+        }
+      } finally {
+        setFiscalUploading(false);
+      }
+    }
+
+    const { responsaveis, ...formDataSemResp } = formData;
+    const dadosParaSalvar: Partial<Empresa> = {
+      ...formDataSemResp,
+      cnpj: formData.cnpj ? String(formData.cnpj) : undefined,
+      cadastrada,
+      servicos: (formData.servicos ?? []).filter(Boolean),
+      tags: (formData.tags ?? []).filter(Boolean),
+      possuiRet: Boolean(formData.possuiRet) && (formData.rets ?? []).length > 0,
+      rets: Boolean(formData.possuiRet) ? (formData.rets ?? []) : [],
+      vencimentosFiscais: vencimentosFiscaisFinal,
+      formaEnvio: Array.isArray(formData.formaEnvio) ? formData.formaEnvio : [],
+      ...(canManage ? { responsaveis: responsaveis ?? {} } : {}),
+    };
+
+    if (empresa?.id) {
+      await atualizarEmpresa(empresa.id, dadosParaSalvar);
+      mostrarAlerta('Empresa atualizada', 'Alterações salvas com sucesso.', 'sucesso');
+    } else {
+      await criarEmpresa(dadosParaSalvar);
+      mostrarAlerta('Empresa cadastrada', 'Empresa cadastrada com sucesso.', 'sucesso');
+    }
+
+    onClose();
+  };
+
+  return (
+    <>
+    <ModalBase
+      isOpen
+      onClose={onClose}
+      labelledBy="empresa-title"
+      dialogClassName="w-full max-w-4xl bg-white rounded-2xl shadow-2xl outline-none max-h-[90vh] overflow-y-auto"
+      zIndex={1400}
+    >
+      <div className="rounded-2xl">
+        <div className="bg-gradient-to-r from-green-500 to-green-600 p-4 sm:p-6 rounded-t-2xl sticky top-0 z-10">
+          <div className="flex justify-between items-center">
+            <h3 id="empresa-title" className="text-xl font-bold text-white">
+              {empresa ? 'Editar Empresa' : 'Cadastrar Nova Empresa'}
+            </h3>
+            <button onClick={onClose} className="text-white hover:bg-white hover:bg-opacity-20 p-2 rounded-lg">
+              <X size={20} />
+            </button>
+          </div>
+        </div>
+
+        <form
+          onSubmit={handleSubmit}
+          className="p-4 sm:p-6 space-y-6"
+          autoComplete="off"
+          data-lpignore="true"
+          data-form-type="other"
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+              e.preventDefault();
+              (e.currentTarget as HTMLFormElement).requestSubmit();
+            }
+            if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'TEXTAREA') {
+              e.preventDefault();
+            }
+          }}
+        >
+          <input type="text" name="prevent-autofill-text" autoComplete="off" className="hidden" tabIndex={-1} aria-hidden="true" />
+          <input type="password" name="prevent-autofill-password" autoComplete="new-password" className="hidden" tabIndex={-1} aria-hidden="true" />
+
+          {/* Tipo de Empresa */}
+          <div className="bg-blue-50 rounded-xl p-4 border border-blue-200">
+            <h4 className="font-semibold text-blue-800 mb-4">Tipo de Empresa</h4>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 cursor-pointer bg-white p-4 rounded-lg border-2 border-gray-200 hover:border-blue-500 transition-all flex-1">
+                <input
+                  type="radio"
+                  name="tipoCadastro"
+                  checked={empresaCadastrada}
+                  onChange={() => setEmpresaCadastrada(true)}
+                  className="w-5 h-5 text-blue-600"
+                />
+                <div>
+                  <div className="font-semibold text-gray-900">Empresa Cadastrada</div>
+                  <div className="text-xs text-gray-600">Já possui CNPJ e Razão Social</div>
+                </div>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer bg-white p-4 rounded-lg border-2 border-gray-200 hover:border-blue-500 transition-all flex-1">
+                <input
+                  type="radio"
+                  name="tipoCadastro"
+                  checked={!empresaCadastrada}
+                  onChange={() => setEmpresaCadastrada(false)}
+                  className="w-5 h-5 text-blue-600"
+                />
+                <div>
+                  <div className="font-semibold text-gray-900">Empresa Nova</div>
+                  <div className="text-xs text-gray-600">Ainda não possui CNPJ</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          {/* Dados Principais */}
+          <div className="bg-green-50 rounded-xl p-4 border border-green-200">
+            <h4 className="font-semibold text-green-800 mb-4">Dados Principais {empresaCadastrada && '*'}</h4>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                  CPF/CNPJ {empresaCadastrada && <span className="text-red-500">*</span>}
+                </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={String(formData.cnpj || '')}
+                    onChange={(e) => {
+                      const valorFormatado = formatarCPFCNPJ(e.target.value);
+                      setCnpjTouched(true);
+                      handleChange('cnpj', valorFormatado);
+                      const digits = valorFormatado.replace(/\D/g, '');
+                      if (digits.length === 14) setEmpresaCadastrada(true);
+                      // Auto-detectar tipo de inscrição e estabelecimento
+                      const autoTipo = detectTipoInscricao(digits, formData.tipoInscricao as TipoInscricao | undefined);
+                      if (autoTipo) handleChange('tipoInscricao', autoTipo);
+                      const autoEstab = detectTipoEstabelecimento(digits);
+                      handleChange('tipoEstabelecimento', autoEstab);
+                    }}
+                    onBlur={() => {
+                      if (!cnpjTouched) return;
+                      if (!podeBuscarCnpj) return;
+                      if (lastAutoLookupDigitsRef.current === cnpjDigits) return;
+                      const parsed = cnpjSchema.safeParse(String(formData.cnpj || ''));
+                      if (!parsed.success) return;
+                      lastAutoLookupDigitsRef.current = cnpjDigits;
+                      void handleBuscarCnpj();
+                    }}
+                    onKeyDown={(e) => {
+                      if (
+                        e.ctrlKey ||
+                        e.metaKey ||
+                        ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key) ||
+                        /^[0-9]$/.test(e.key)
+                      )
+                        return;
+                      e.preventDefault();
+                    }}
+                    className={`w-full px-4 py-3 pr-12 border rounded-xl focus:ring-2 focus:ring-green-500 ${erros.cnpj ? 'border-red-500' : 'border-gray-300'} bg-white text-gray-900`}
+                    placeholder={empresaCadastrada ? '000.000.000-00 ou 00.000.000/0000-00' : 'Opcional'}
+                    required={false}
+                    maxLength={18}
+                  />
+
+                  <button
+                    type="button"
+                    onClick={handleBuscarCnpj}
+                    disabled={!podeBuscarCnpj}
+                    title={cnpjDigits.length === 14 ? 'Buscar dados do CNPJ' : 'Digite um CNPJ com 14 dígitos'}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg border border-gray-200 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                    aria-label="Buscar dados do CNPJ"
+                  >
+                    {buscandoCnpj ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
+                  </button>
+                </div>
+                {erros.cnpj && <p className="mt-1 text-sm text-red-500">{erros.cnpj}</p>}
+                {!erros.cnpj && cnpjLookupError && <p className="mt-1 text-sm text-red-500">{cnpjLookupError}</p>}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                  Código <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={String(formData.codigo || '')}
+                  onChange={(e) => handleChange('codigo', e.target.value)}
+                  className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-green-500 ${erros.codigo ? 'border-red-500' : 'border-gray-300'} bg-white text-gray-900`}
+                  placeholder="001"
+                  required
+                />
+                {erros.codigo && <p className="mt-1 text-sm text-red-500">{erros.codigo}</p>}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Matriz/Filial</label>
+                <select
+                  value={tipoEstabelecimentoSelectValue}
+                  onChange={(e) => handleTipoEstabelecimentoChange(e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 bg-white text-gray-900"
+                >
+                  <option value="">Selecione...</option>
+                  <option value="matriz">Matriz</option>
+                  <option value="filial">Filial</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                  Razão Social {empresaCadastrada && <span className="text-red-500">*</span>}
+                </label>
+                <input
+                  type="text"
+                  value={String(formData.razao_social || '')}
+                  onChange={(e) => handleChange('razao_social', e.target.value)}
+                  className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-green-500 ${erros.razao_social ? 'border-red-500' : 'border-gray-300'} bg-white text-gray-900`}
+                  placeholder={empresaCadastrada ? 'Nome oficial da empresa' : 'Nome provisório (opcional)'}
+                  required={empresaCadastrada}
+                />
+                {erros.razao_social && <p className="mt-1 text-sm text-red-500">{erros.razao_social}</p>}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Apelido/Nome Fantasia</label>
+                <input
+                  type="text"
+                  value={String(formData.apelido || '')}
+                  onChange={(e) => handleChange('apelido', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 bg-white text-gray-900"
+                  placeholder="Apelido"
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Tipo de Inscrição</label>
+                <select
+                  value={formData.tipoInscricao}
+                  onChange={(e) => handleChange('tipoInscricao', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 bg-white text-gray-900"
+                >
+                  <option value="">Selecione...</option>
+                  <option value="CNPJ">CNPJ</option>
+                  <option value="CPF">CPF</option>
+                  <option value="MEI">MEI</option>
+                  <option value="CAEPF">CAEPF</option>
+                  <option value="CNO">CNO</option>
+                  <option value="CEI">CEI</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Data de Abertura</label>
+                <input
+                  type="date"
+                  value={String(formData.data_abertura || '')}
+                  onChange={(e) => handleChange('data_abertura', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 bg-white text-gray-900"
+                />
+              </div>
+            </div>
+
+
+            {!empresaCadastrada && (
+              <div className="mt-4 bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                <p className="text-sm text-yellow-800">
+                  ⚠️ <strong>Empresa não cadastrada:</strong> Os campos CNPJ e Razão Social são opcionais.
+                  Complete estas informações quando a empresa for oficializada.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Serviços */}
+          <div className="bg-cyan-50 rounded-xl p-4 border border-cyan-200">
+            <h4 className="font-semibold text-cyan-800 mb-4">Serviços contratados</h4>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {allServicos.map((s) => (
+                <label key={s} className="flex items-center gap-3 rounded-xl border bg-white px-4 py-3 cursor-pointer hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    checked={(formData.servicos ?? []).includes(s)}
+                    onChange={() => toggleServico(s)}
+                    className="h-5 w-5"
+                  />
+                  <span className="font-semibold text-gray-900">{s}</span>
+                </label>
+              ))}
+            </div>
+
+            <div className="mt-4 flex gap-3">
+              <input
+                value={servicoNovo}
+                onChange={(e) => setServicoNovo(e.target.value)}
+                className="flex-1 rounded-xl border px-4 py-3 bg-white"
+                placeholder="Adicionar outro serviço (ex.: Abertura, DP, etc)"
+              />
+              <button
+                type="button"
+                onClick={addServico}
+                className="inline-flex items-center gap-2 rounded-xl bg-cyan-600 text-white px-4 py-3 font-semibold hover:bg-cyan-700"
+                disabled={!servicoNovo.trim()}
+              >
+                <Plus size={18} />
+                Adicionar
+              </button>
+            </div>
+
+            <div className="mt-2 text-xs text-gray-600">Você pode selecionar mais de um serviço.</div>
+          </div>
+
+          {/* Tags */}
+          {tagsCadastradas.length > 0 && (
+            <div className="bg-violet-50 rounded-xl p-4 border border-violet-200">
+              <h4 className="font-semibold text-violet-800 mb-4">Tags</h4>
+              <div className="flex flex-wrap gap-2">
+                {tagsCadastradas.map((tag) => {
+                  const selected = (formData.tags ?? []).includes(tag.nome);
+                  const colors = TAG_COLORS[tag.cor] ?? TAG_COLORS.slate;
+                  return (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      onClick={() => toggleTag(tag.nome)}
+                      className={`rounded-full px-3.5 py-1.5 text-xs font-bold border transition ${
+                        selected
+                          ? `${colors.bg} ${colors.text} ${colors.border} ring-2 ring-offset-1 ring-violet-400`
+                          : 'bg-white text-gray-400 border-gray-200 hover:bg-gray-50'
+                      }`}
+                    >
+                      {tag.nome}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="mt-2 text-xs text-gray-600">Clique para selecionar ou desmarcar tags.</div>
+            </div>
+          )}
+
+          {/* RET */}
+          <div className="bg-blue-50 rounded-xl p-4 border border-blue-200">
+            <h4 className="font-semibold text-blue-800 mb-4">Possui RET?</h4>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 cursor-pointer bg-white p-3 rounded-lg border border-gray-200 hover:bg-gray-50">
+                <input type="radio" name="possuiRet" checked={Boolean(formData.possuiRet)} onChange={() => setPossuiRet(true)} />
+                <span className="font-semibold">Sim</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer bg-white p-3 rounded-lg border border-gray-200 hover:bg-gray-50">
+                <input type="radio" name="possuiRet" checked={!formData.possuiRet} onChange={() => setPossuiRet(false)} />
+                <span className="font-semibold">Não</span>
+              </label>
+            </div>
+
+            {formData.possuiRet && (
+              <div className="mt-4 space-y-4">
+                {(formData.rets ?? []).map((r, idx) => (
+                  <div key={r.id} className="rounded-2xl border bg-white p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="font-bold text-gray-900">RET {idx + 1}</div>
+                      <button type="button" onClick={() => setConfirmDeleteRetId(r.id)} className="rounded-xl border p-2 hover:bg-gray-50" title="Remover RET">
+                        <Trash2 className="text-red-600" size={18} />
+                      </button>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Número do PTA *</label>
+                        <input
+                          value={formatRetNumber(r.numeroPta)}
+                          onChange={(e) => updateRet(r.id, { numeroPta: e.target.value.replace(/\D/g, '').slice(0, 13) })}
+                          className={`w-full rounded-xl border px-4 py-3 ${erros[`ret_${idx}_numeroPta`] ? 'border-red-500' : 'border-gray-300'}`}
+                          placeholder="Ex.: 01.000123456-78"
+                        />
+                        {erros[`ret_${idx}_numeroPta`] && <div className="text-sm text-red-500 mt-1">{erros[`ret_${idx}_numeroPta`]}</div>}
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Nome *</label>
+                        <textarea
+                          value={r.nome}
+                          onChange={(e) => updateRet(r.id, { nome: e.target.value })}
+                          className={`w-full rounded-xl border px-4 py-3 resize-none ${erros[`ret_${idx}_nome`] ? 'border-red-500' : 'border-gray-300'}`}
+                          placeholder="Ex.: RET X"
+                          rows={2}
+                        />
+                        {erros[`ret_${idx}_nome`] && <div className="text-sm text-red-500 mt-1">{erros[`ret_${idx}_nome`]}</div>}
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Vencimento *</label>
+                        <input
+                          type="date"
+                          value={r.vencimento}
+                          onChange={(e) => updateRet(r.id, { vencimento: e.target.value })}
+                          className={`w-full rounded-xl border px-4 py-3 ${erros[`ret_${idx}_vencimento`] ? 'border-red-500' : 'border-gray-300'}`}
+                        />
+                        {erros[`ret_${idx}_vencimento`] && <div className="text-sm text-red-500 mt-1">{erros[`ret_${idx}_vencimento`]}</div>}
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Última data de renovação</label>
+                        <input
+                          type="date"
+                          value={r.ultimaRenovacao}
+                          onChange={(e) => updateRet(r.id, { ultimaRenovacao: e.target.value })}
+                          className={`w-full rounded-xl border px-4 py-3 ${erros[`ret_${idx}_ultimaRenovacao`] ? 'border-red-500' : 'border-gray-300'}`}
+                        />
+                        {erros[`ret_${idx}_ultimaRenovacao`] && <div className="text-sm text-red-500 mt-1">{erros[`ret_${idx}_ultimaRenovacao`]}</div>}
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Portaria</label>
+                        <input
+                          value={r.portaria ?? ''}
+                          onChange={(e) => updateRet(r.id, { portaria: e.target.value.slice(0, 20) })}
+                          maxLength={20}
+                          className="w-full rounded-xl border border-gray-300 px-4 py-3"
+                          placeholder="Ex.: 123/2025"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">Status do RET</label>
+                        <div className="flex gap-3">
+                          <button
+                            type="button"
+                            onClick={() => updateRet(r.id, { ativo: true })}
+                            className={`flex-1 rounded-xl border-2 px-4 py-3 font-bold text-center transition-all ${
+                              r.ativo !== false
+                                ? 'border-emerald-500 bg-emerald-50 text-emerald-700'
+                                : 'border-gray-200 bg-white text-gray-400 hover:bg-gray-50'
+                            }`}
+                          >
+                            Ativo
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updateRet(r.id, { ativo: false })}
+                            className={`flex-1 rounded-xl border-2 px-4 py-3 font-bold text-center transition-all ${
+                              r.ativo === false
+                                ? 'border-red-500 bg-red-50 text-red-700'
+                                : 'border-gray-200 bg-white text-gray-400 hover:bg-gray-50'
+                            }`}
+                          >
+                            Inativo
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                <button
+                  type="button"
+                  onClick={addRet}
+                  className="inline-flex items-center gap-2 rounded-xl bg-cyan-600 text-white px-4 py-3 font-semibold hover:bg-cyan-700"
+                >
+                  <Plus size={18} />
+                  Adicionar RET
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Vencimentos Fiscais */}
+          <div className="bg-red-50 rounded-xl p-4 border border-red-200">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle size={18} className="text-red-600" />
+              <h4 className="font-semibold text-red-800">Vencimentos Fiscais</h4>
+            </div>
+            <p className="text-xs text-red-700 mb-4">
+              Defina a data de vencimento de cada obrigação. O anexo é opcional — mas o vencimento aparece no painel
+              de Vencimentos piscando quando estiver próximo ou vencido, para nunca deixar o cliente na mão.
+            </p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3" data-section="fiscais">
+              {(formData.vencimentosFiscais ?? []).map((v) => {
+                const pendingFile = fiscaisPendingFiles[v.id];
+                return (
+                  <div key={v.id} className="rounded-xl border border-red-100 bg-white p-3">
+                    <div className="flex items-center gap-2">
+                      <CalendarClock size={14} className="text-red-500 shrink-0" />
+                      <div className="text-sm font-bold text-gray-900 truncate" title={v.nome}>{v.nome}</div>
+                    </div>
+
+                    <label className="block mt-2 text-[11px] font-semibold text-gray-600">
+                      Data de vencimento
+                    </label>
+                    <input
+                      type="date"
+                      value={v.vencimento || ''}
+                      onChange={(e) => updateVencimentoFiscal(v.id, { vencimento: e.target.value })}
+                      className="mt-1 w-full rounded-lg border px-3 py-2 text-sm"
+                    />
+
+                    <label className="block mt-2 text-[11px] font-semibold text-gray-600">
+                      Anexo <span className="font-normal text-gray-400">(opcional)</span>
+                    </label>
+                    {pendingFile ? (
+                      <div className="mt-1 rounded-lg border border-orange-200 bg-orange-50 px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <Paperclip size={12} className="text-orange-600 shrink-0" />
+                          <span className="text-[11px] font-semibold text-gray-900 truncate flex-1" title={pendingFile.name}>{pendingFile.name}</span>
+                        </div>
+                        <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => visualizarPendingFile(pendingFile)}
+                            className="inline-flex items-center gap-1 text-[11px] text-blue-600 font-bold hover:text-blue-700"
+                            title="Visualizar"
+                          >
+                            <Eye size={12} /> Visualizar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => baixarPendingFile(pendingFile)}
+                            className="inline-flex items-center gap-1 text-[11px] text-emerald-600 font-bold hover:text-emerald-700"
+                            title="Baixar"
+                          >
+                            <Download size={12} /> Baixar
+                          </button>
+                          <label className="inline-flex items-center gap-1 text-[11px] text-violet-600 font-bold cursor-pointer hover:text-violet-700" title="Trocar arquivo">
+                            <Paperclip size={12} /> Trocar
+                            <input
+                              type="file"
+                              accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.txt"
+                              className="hidden"
+                              onChange={(e) => setFiscalFile(v.id, e.target.files?.[0] ?? null)}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => setFiscalFile(v.id, null)}
+                            className="inline-flex items-center gap-1 text-[11px] text-red-500 font-bold hover:text-red-600 ml-auto"
+                            title="Remover"
+                          >
+                            <Trash2 size={12} /> Remover
+                          </button>
+                        </div>
+                        <div className="mt-1 text-[10px] text-orange-700">Novo arquivo - sera enviado ao salvar</div>
+                      </div>
+                    ) : v.arquivoUrl ? (
+                      <div className="mt-1 rounded-lg border border-green-200 bg-green-50 px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <Paperclip size={12} className="text-green-600 shrink-0" />
+                          <span className="text-[11px] font-semibold text-green-700 flex-1">Arquivo anexado</span>
+                        </div>
+                        <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => v.arquivoUrl && visualizarArquivoSalvo(v.arquivoUrl)}
+                            className="inline-flex items-center gap-1 text-[11px] text-blue-600 font-bold hover:text-blue-700"
+                            title="Visualizar"
+                          >
+                            <Eye size={12} /> Visualizar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => v.arquivoUrl && baixarArquivoSalvo(v.arquivoUrl, `${v.nome}${v.arquivoUrl.match(/\.[a-zA-Z0-9]+$/)?.[0] ?? ''}`)}
+                            className="inline-flex items-center gap-1 text-[11px] text-emerald-600 font-bold hover:text-emerald-700"
+                            title="Baixar"
+                          >
+                            <Download size={12} /> Baixar
+                          </button>
+                          <label className="inline-flex items-center gap-1 text-[11px] text-violet-600 font-bold cursor-pointer hover:text-violet-700" title="Trocar arquivo">
+                            <Paperclip size={12} /> Trocar
+                            <input
+                              type="file"
+                              accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.txt"
+                              className="hidden"
+                              onChange={(e) => setFiscalFile(v.id, e.target.files?.[0] ?? null)}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => updateVencimentoFiscal(v.id, { arquivoUrl: undefined })}
+                            className="inline-flex items-center gap-1 text-[11px] text-red-500 font-bold hover:text-red-600 ml-auto"
+                            title="Remover"
+                          >
+                            <Trash2 size={12} /> Remover
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <label className="mt-1 block w-full rounded-lg border-2 border-dashed border-gray-300 px-3 py-2 text-center hover:border-red-400 hover:bg-red-50 transition text-[11px] text-gray-500 cursor-pointer">
+                        Anexar arquivo
+                        <input
+                          type="file"
+                          accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.txt"
+                          className="hidden"
+                          onChange={(e) => setFiscalFile(v.id, e.target.files?.[0] ?? null)}
+                        />
+                      </label>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Forma de Envio */}
+          <div className="bg-teal-50 rounded-xl p-4 border border-teal-200">
+            <h4 className="font-semibold text-teal-800 mb-2">Forma de Envio</h4>
+            <p className="text-xs text-teal-700 mb-3">
+              Como os documentos, guias e avisos devem ser enviados para esse cliente. Você pode marcar mais de uma opção.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {FORMAS_ENVIO.map((opt) => {
+                const selected = formasEnvioSelecionadas.includes(opt.value);
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => handleChange(
+                      'formaEnvio',
+                      selected
+                        ? formasEnvioSelecionadas.filter((item) => item !== opt.value)
+                        : [...formasEnvioSelecionadas, opt.value]
+                    )}
+                    className={`rounded-xl border-2 px-3 py-3 font-bold text-sm transition ${
+                      selected
+                        ? 'bg-teal-100 border-teal-500 text-teal-800'
+                        : 'bg-white border-gray-200 text-gray-600 hover:border-teal-300 hover:bg-teal-50'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            {formasEnvioSelecionadas.length > 0 && (
+              <button
+                type="button"
+                onClick={() => handleChange('formaEnvio', [] as FormaEnvio[])}
+                className="mt-2 text-xs text-teal-700 font-semibold hover:text-teal-900"
+              >
+                Limpar seleções
+              </button>
+            )}
+          </div>
+
+          {/* Responsáveis */}
+          {canManage && (
+          <div className="bg-gray-50 rounded-xl p-4 border border-gray-200">
+            <h4 className="font-semibold text-gray-800 mb-4">Responsáveis por Departamento</h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {sortedDepartamentos.map((d) => (
+                <div key={d.id}>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">{d.nome}</label>
+                  <select
+                    value={(formData.responsaveis as Record<string, string | null> | undefined)?.[d.id] ?? ''}
+                    onChange={(e) => {
+                      const userId = e.target.value || null;
+                      setFormData((prev) => ({
+                        ...prev,
+                        responsaveis: { ...(prev.responsaveis ?? {}), [d.id]: userId },
+                      }));
+                    }}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white"
+                  >
+                    <option value="">(Sem responsável)</option>
+                    {activeUsers.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.nome}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="text-xs text-gray-500 mt-1">Mostra todos os usuários ativos.</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          )}
+
+          {/* Inscrições e Regimes */}
+          <div className="bg-blue-50 rounded-xl p-4 border border-blue-200">
+            <h4 className="font-semibold text-blue-800 mb-4">Inscrições e Regimes</h4>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Inscrição Estadual</label>
+                <input
+                  type="text"
+                  value={String(formData.inscricao_estadual || '')}
+                  onChange={(e) => handleChange('inscricao_estadual', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Inscrição Municipal</label>
+                <input
+                  type="text"
+                  value={String(formData.inscricao_municipal || '')}
+                  onChange={(e) => handleChange('inscricao_municipal', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Regime Federal</label>
+                <select
+                  value={String(formData.regime_federal || '')}
+                  onChange={(e) => handleChange('regime_federal', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                >
+                  <option value="">Selecione...</option>
+                  <option value="MEI">MEI</option>
+                  <option value="Simples Nacional">Simples Nacional</option>
+                  <option value="Lucro Presumido">Lucro Presumido</option>
+                  <option value="Lucro Real">Lucro Real</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Regime Estadual</label>
+                <input
+                  type="text"
+                  value={String(formData.regime_estadual || '')}
+                  onChange={(e) => handleChange('regime_estadual', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Regime Municipal</label>
+                <input
+                  type="text"
+                  value={String(formData.regime_municipal || '')}
+                  onChange={(e) => handleChange('regime_municipal', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Particularidades da Empresa */}
+          <div className="bg-amber-50 rounded-xl p-4 border border-amber-200">
+            <h4 className="font-semibold text-amber-800 mb-2">Particularidades da Empresa</h4>
+            <p className="text-xs text-amber-700/80 mb-3">
+              Anotações livres sobre essa empresa (regime especial, tratamento contábil/fiscal específico, combinados com o cliente, etc.).
+            </p>
+            <textarea
+              value={String(formData.particularidades || '')}
+              onChange={(e) => handleChange('particularidades', e.target.value)}
+              rows={6}
+              placeholder="Descreva aqui as particularidades dessa empresa..."
+              className="w-full px-4 py-3 border border-amber-300 rounded-xl focus:ring-2 focus:ring-amber-500 bg-white text-gray-900 resize-y"
+            />
+          </div>
+
+          {/* Endereço */}
+          <div className="bg-cyan-50 rounded-xl p-4 border border-cyan-200">
+            <h4 className="font-semibold text-cyan-800 mb-4">Endereço</h4>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">CEP</label>
+                <input
+                  type="text"
+                  value={String(formData.cep || '')}
+                  autoComplete="new-password"
+                  onChange={(e) => {
+                    const apenasNumeros = e.target.value.replace(/\D/g, '');
+                    const valorFormatado = formatarCEP(apenasNumeros);
+                    handleChange('cep', valorFormatado);
+                  }}
+                  onKeyDown={(e) => {
+                    if (
+                      e.ctrlKey ||
+                      e.metaKey ||
+                      ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key) ||
+                      /^[0-9]$/.test(e.key)
+                    )
+                      return;
+                    e.preventDefault();
+                  }}
+                  className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-cyan-500 ${erros.cep ? 'border-red-500' : 'border-gray-300'} bg-white text-gray-900`}
+                  placeholder="00000-000"
+                  maxLength={9}
+                />
+                {erros.cep && <p className="mt-1 text-sm text-red-500">{erros.cep}</p>}
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Estado</label>
+                <select
+                  value={String(formData.estado || '')}
+                  autoComplete="new-password"
+                  onChange={(e) => handleChange('estado', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 bg-white text-gray-900"
+                >
+                  <option value="">Selecione...</option>
+                  {['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'].map((uf) => (
+                    <option key={uf} value={uf}>{uf}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Cidade</label>
+                <input
+                  type="text"
+                  value={String(formData.cidade || '')}
+                  autoComplete="new-password"
+                  onChange={(e) => handleChange('cidade', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 bg-white text-gray-900"
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Bairro</label>
+                <input
+                  type="text"
+                  value={String(formData.bairro || '')}
+                  autoComplete="new-password"
+                  onChange={(e) => handleChange('bairro', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 bg-white text-gray-900"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-2">Logradouro</label>
+                <input
+                  type="text"
+                  value={String(formData.logradouro || '')}
+                  autoComplete="new-password"
+                  onChange={(e) => handleChange('logradouro', e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 bg-white text-gray-900"
+                  placeholder="Rua, Avenida..."
+                />
+              </div>
+            </div>
+
+            <div className="mt-4">
+              <label className="block text-sm font-semibold text-gray-700 mb-2">Número</label>
+              <input
+                type="text"
+                value={String(formData.numero || '')}
+                autoComplete="new-password"
+                onChange={(e) => {
+                  const apenasNumeros = e.target.value.replace(/\D/g, '');
+                  handleChange('numero', apenasNumeros);
+                }}
+                onKeyDown={(e) => {
+                  if (
+                    e.ctrlKey ||
+                    e.metaKey ||
+                    ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key) ||
+                    /^[0-9]$/.test(e.key)
+                  )
+                    return;
+                  e.preventDefault();
+                }}
+                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-cyan-500 bg-white text-gray-900"
+              />
+            </div>
+          </div>
+
+          {/* Botões */}
+          <div className="flex gap-4 pt-6 border-t border-gray-200">
+            <button type="button" onClick={onClose} className="flex-1 px-6 py-3 text-gray-700 border border-gray-300 rounded-xl hover:bg-gray-100">
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={fiscalUploading}
+              className="flex-1 px-6 py-3 bg-gradient-to-r from-green-500 to-green-600 text-white rounded-xl font-medium hover:shadow-lg transition-all disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+            >
+              {fiscalUploading && <Loader2 size={16} className="animate-spin" />}
+              {fiscalUploading ? 'Enviando anexos...' : (empresa ? 'Salvar Alterações' : 'Cadastrar Empresa')}
+            </button>
+          </div>
+        </form>
+      </div>
+    </ModalBase>
+
+    <ConfirmModal
+      open={!!confirmDeleteRetId}
+      title="Remover RET?"
+      message="Tem certeza que deseja remover este RET? Esta ação não poderá ser desfeita."
+      confirmText="Remover"
+      variant="danger"
+      onConfirm={() => { if (confirmDeleteRetId) removeRet(confirmDeleteRetId); setConfirmDeleteRetId(null); }}
+      onCancel={() => setConfirmDeleteRetId(null)}
+    />
+    </>
+  );
+}
+
+
+
