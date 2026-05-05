@@ -18,9 +18,6 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Controle de Empresas",
   description: "Filtros e análises de empresas",
-  icons: {
-    icon: "/triar.png",
-  },
 };
 
 export default function RootLayout({

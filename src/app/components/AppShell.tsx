@@ -1,10 +1,9 @@
 'use client';
 
 import Link from 'next/link';
-import Image from 'next/image';
 import { usePathname } from 'next/navigation';
 import React, { useMemo, useState, useEffect, useRef } from 'react';
-import { LogOut, Shield, User, LayoutDashboard, CalendarDays, Building2, Users, Layers, BarChart3, ClipboardList, Briefcase, AlertTriangle, Archive, Trash2, Bell, CheckCircle, XCircle, Info, ChevronLeft, ChevronRight, HardDrive, Menu, X, Terminal, WrenchIcon, Loader2, Tag, Grid3x3, ListChecks, FileStack } from 'lucide-react';
+import { LogOut, Shield, User, LayoutDashboard, CalendarDays, Building2, Users, Layers, BarChart3, ClipboardList, Briefcase, AlertTriangle, Archive, Trash2, Bell, CheckCircle, XCircle, Info, ChevronLeft, ChevronRight, HardDrive, Menu, X, Terminal, WrenchIcon, Loader2, Tag, Grid3x3, ListChecks, FileStack, Eye, EyeOff } from 'lucide-react';
 import { useSistema } from '@/app/context/SistemaContext';
 import { daysUntil, isRetRenovado } from '@/app/utils/date';
 import { getDepartamentoSlugDoUsuario, type DepartamentoSlug } from '@/app/utils/departamento';
@@ -56,7 +55,7 @@ const nav: NavItem[] = [
   { href: '/backup', label: 'Backup', icon: HardDrive },
 ];
 
-const BROWSER_NOTIF_SESSION_KEY = 'controle-triar-browser-notifs-shown-v1';
+const BROWSER_NOTIF_SESSION_KEY = 'controle-browser-notifs-shown-v1';
 const FISCAL_NOTIF_TITLE_PREFIX = 'Vencimento fiscal ';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
@@ -65,6 +64,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [showLogin, setShowLogin] = useState(false);
   const [email, setEmail] = useState('');
   const [senha, setSenha] = useState('');
+  const [showSenha, setShowSenha] = useState(false);
   const [showNotifs, setShowNotifs] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -320,8 +320,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     for (const notificacao of itensParaExibir) {
       const alerta = new Notification(notificacao.titulo, {
         body: notificacao.mensagem,
-        icon: '/triar.png',
-        badge: '/triar.png',
         tag: notificacao.id,
         requireInteraction: true,
       });
@@ -334,8 +332,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     if (pendentes.length > itensParaExibir.length) {
       const resumo = new Notification('Lembrete de vencimentos fiscais', {
         body: `Voce tem ${pendentes.length} alerta(s) fiscal(is) pendentes. Abra o sininho para revisar.`,
-        icon: '/triar.png',
-        badge: '/triar.png',
         tag: 'fiscal-alert-summary',
         requireInteraction: true,
       });
@@ -369,9 +365,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return (
       <div className="min-h-screen bg-gray-100 flex items-center justify-center">
         <div className="text-center">
-          <div className="h-12 w-12 mx-auto mb-4 rounded-2xl bg-cyan-50 flex items-center justify-center overflow-hidden shadow-sm ring-1 ring-cyan-100">
-            <Image src="/triar.png" alt="Triar" width={48} height={48} priority />
-          </div>
+          <div className="h-12 w-12 mx-auto mb-4 rounded-2xl bg-cyan-50 flex items-center justify-center overflow-hidden shadow-sm ring-1 ring-cyan-100" />
           <div className="text-sm text-gray-500 animate-pulse">Carregando...</div>
         </div>
       </div>
@@ -466,9 +460,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <Menu size={22} />
           </button>
           <Link href="/dashboard" className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg overflow-hidden">
-              <Image src="/triar.png" alt="Triar" width={32} height={32} priority className="w-8 h-8 object-contain" />
-            </div>
             <span className="text-sm font-bold text-gray-900">Controle de Empresas</span>
           </Link>
           <div className="flex items-center gap-1">
@@ -502,9 +493,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       >
         <div className="flex items-center justify-between px-4 py-4 border-b border-gray-100">
           <Link href="/dashboard" className="flex items-center gap-3" onClick={() => setMobileMenuOpen(false)}>
-            <div className="w-10 h-10 rounded-xl overflow-hidden">
-              <Image src="/triar.png" alt="Logo Triar" width={40} height={40} priority className="w-10 h-10 object-contain" />
-            </div>
             <div className="leading-tight">
               <span className="block text-[10px] font-bold text-gray-400 tracking-widest uppercase">Controle de</span>
               <span className="block text-lg font-extrabold text-gray-900 leading-none">Empresas</span>
@@ -595,9 +583,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {/* Logo + Nome */}
         <div className={`flex items-center border-b border-gray-100 py-5 ${sidebarOpen ? 'px-4 gap-4' : 'justify-center px-0'}`}>
           <Link href="/dashboard" className="flex items-center gap-4 min-w-0">
-            <div className="w-16 h-16 rounded-2xl overflow-hidden shrink-0">
-              <Image src="/triar.png" alt="Logo Triar" width={64} height={64} priority className="w-16 h-16 object-contain" />
-            </div>
             {sidebarOpen && (
               <div className="leading-tight min-w-0 overflow-hidden">
                 <span className="block text-xs font-bold text-gray-400 tracking-widest uppercase whitespace-nowrap">Controle de</span>
@@ -749,9 +734,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <div className="relative w-full max-w-md rounded-2xl bg-white shadow-2xl overflow-hidden">
             <div className="bg-gradient-to-r from-cyan-600 to-teal-600 p-6">
               <div className="flex items-center gap-3">
-                <div className="h-12 w-12 rounded-xl bg-white/20 flex items-center justify-center">
-                  <Image src="/triar.png" alt="Triar" width={36} height={36} />
-                </div>
                 <div>
                   <div className="text-lg font-bold text-white">
                     {showForgot ? 'Recuperar Senha' : 'Entrar no Sistema'}
@@ -904,14 +886,25 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 </div>
                 <div>
                   <label className="block text-sm font-semibold text-gray-700 mb-2">Senha</label>
-                  <input
-                    type="password"
-                    value={senha}
-                    onChange={(e) => setSenha(e.target.value)}
-                    className="w-full rounded-xl bg-gray-50 px-4 py-3 text-gray-900 focus:ring-2 focus:ring-cyan-400 focus:bg-white transition"
-                    placeholder="Senha"
-                    onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
-                  />
+                  <div className="relative">
+                    <input
+                      type={showSenha ? 'text' : 'password'}
+                      value={senha}
+                      onChange={(e) => setSenha(e.target.value)}
+                      className="w-full rounded-xl bg-gray-50 px-4 py-3 pr-12 text-gray-900 focus:ring-2 focus:ring-cyan-400 focus:bg-white transition"
+                      placeholder="Senha"
+                      onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowSenha((v) => !v)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 p-1"
+                      aria-label={showSenha ? 'Ocultar senha' : 'Mostrar senha'}
+                      tabIndex={-1}
+                    >
+                      {showSenha ? <EyeOff size={18} /> : <Eye size={18} />}
+                    </button>
+                  </div>
                 </div>
                 <button
                   onClick={handleLogin}
