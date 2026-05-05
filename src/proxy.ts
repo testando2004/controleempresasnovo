@@ -33,6 +33,6 @@ export function proxy(request: NextRequest) {
 export const config = {
   matcher: [
     // Todas as rotas exceto arquivos estáticos do Next.js
-    '/((?!_next/static|_next/image|favicon.ico|triar.png).*)',
+    '/((?!_next/static|_next/image|favicon.ico).*)',
   ],
 };

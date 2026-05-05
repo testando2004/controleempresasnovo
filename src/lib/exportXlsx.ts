@@ -46,7 +46,7 @@ export async function exportEmpresasXlsx(
   const getResp = buildRespResolver(departamentos, usuarios);
 
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'Controle Triar';
+  wb.creator = 'Controle de Empresas';
   wb.created = new Date();
   const ws = wb.addWorksheet('Empresas');
 
