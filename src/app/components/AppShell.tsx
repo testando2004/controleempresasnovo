@@ -43,7 +43,7 @@ const nav: NavItem[] = [
   { href: '/vencimentos-cadastro/controle', label: 'Controle Cadastro', icon: ListChecks, department: 'cadastro' },
   { href: '/calendario', label: 'Calendário', icon: CalendarDays },
   { href: '/dev', label: 'Controle', icon: Terminal, ghostOnly: true },
-  { href: '/obrigacoes', label: 'Obrigações', icon: FileStack, emailOnly: 'yasjean07@gmail.com' },
+  // { href: '/obrigacoes', label: 'Obrigações', icon: FileStack, emailOnly: 'yasjean07@gmail.com' }, // oculto até concluir o módulo
   { href: '/empresas', label: 'Empresas', icon: Building2 },
   { href: '/servicos', label: 'Serviços', icon: Briefcase },
   { href: '/tags', label: 'Tags', icon: Tag },
