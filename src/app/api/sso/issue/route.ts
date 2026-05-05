@@ -77,7 +77,7 @@ export async function POST(req: Request) {
   const sigB64 = b64urlEncode(sig);
   const ssoToken = `${payloadB64}.${sigB64}`;
 
-  const tarefasUrl = process.env.NEXT_PUBLIC_TAREFAS_URL || 'https://controle-tarefas.vercel.app';
+  const tarefasUrl = process.env.NEXT_PUBLIC_TAREFAS_URL || 'https://controletarefasnovo.vercel.app';
   const ssoUrl = `${tarefasUrl.replace(/\/$/, '')}/sso?token=${encodeURIComponent(ssoToken)}`;
 
   return NextResponse.json({ token: ssoToken, ssoUrl });

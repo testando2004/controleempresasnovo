@@ -11,7 +11,7 @@ interface Props {
   onClick?: () => void;
 }
 
-const FALLBACK_TAREFAS_URL = 'https://controle-tarefas.vercel.app';
+const FALLBACK_TAREFAS_URL = 'https://controletarefasnovo.vercel.app';
 
 export default function BotaoTarefas({ variant, onClick }: Props) {
   const [loading, setLoading] = useState(false);
